@@ -55,8 +55,9 @@ antrean job; worker yang mengeksekusinya.
     VoxCPM2; worker TIDAK diubah (ia meneruskan `job.text` apa adanya
     ke model), jadi tidak ada risiko merusak sintesis yang sudah jalan.
     Timbre tetap dari suara referensi Anda.
-  - **Cerita** — sama seperti sebelumnya (OpenAI tulis naskah per adegan
-    → tiap adegan jadi job VO VoxCPM).
+  - **Cerita** — sama seperti sebelumnya (LLM tulis naskah per adegan
+    → tiap adegan jadi job VO VoxCPM; OpenAI atau Gemini, lihat
+    "Cerita" di bawah).
 - **Hapus suara** (baru, melengkapi CRUD) — tombol "Hapus suara" di tiap
   suara tersimpan: menghapus row di tabel `voices`, file referensi di
   bucket `voice-refs`, dan (lewat FK cascade) semua job VO suara itu
@@ -92,9 +93,10 @@ bila diminta, dengan endpoint + worker yang sesuai.
    tombol Download WAV + hapus job.
 4. **Cerita** — tulis ide cerita + pilih durasi target (30 dtk /
    1 mnt / 3 mnt / 5 mnt / 10 mnt) + pilih suara, lalu "Buat Naskah
-   & VO": OpenAI (gpt-4o-mini) menulis naskah per adegan (3–8 adegan),
+   & VO": LLM (OpenAI gpt-4o-mini, atau Gemini — lihat "Cerita" di
+   bawah) menulis naskah per adegan (3–8 adegan),
    naskah disimpan di tabel `stories`, dan TIAP adegan langsung
-   dibuatkan 1 job VO (suara tetap VoxCPM2 — OpenAI HANYA menulis
+   dibuatkan 1 job VO (suara tetap VoxCPM2 — LLM HANYA menulis
    naskah, tidak membuat suara). Naskah per adegan ditampilkan di
    halaman; hasil audionya muncul di bagian Hasil seperti job biasa.
 5. **Layar status koneksi** — bila env Supabase belum diisi, aplikasi
@@ -127,29 +129,40 @@ harian. Aplikasi ini dirancang supaya tidak menggerus kuota itu:
 - **Tanpa realtime/WebSocket** — sengaja, supaya tidak ada koneksi
   yang terus-menerus hidup.
 
-## Cerita (OpenAI tulis naskah, VoxCPM baca)
+## Cerita (LLM tulis naskah, VoxCPM baca)
 
 Terinspirasi repo bang-story (bangtutorial/bang-story, MIT) — aplikasi
 desktop Electron: ide cerita → AI susun naskah per adegan →
 gambar/video AI (Higgsfield) → narasi AI → editor timeline → ekspor
 MP4. Website ini mengambil **HANYA bagian naskahnya**:
 
-- **Yang ada**: ide → OpenAI tulis naskah per adegan → tiap adegan
+- **Yang ada**: ide → LLM tulis naskah per adegan → tiap adegan
   jadi job VO VoxCPM (suara referensi Anda).
 - **Yang TIDAK ada** (sengaja): gambar/video AI (Higgsfield tidak
   dipakai), editor timeline, ekspor MP4. Cerita di sini berhenti di
   audio per adegan — cukup untuk naskah + narasi.
 
-Cara dapat OpenAI API key: [platform.openai.com](https://platform.openai.com)
-→ API keys → Create new secret key. Isi ke `OPENAI_API_KEY` di
-`.env.local` (lokal) / Environment Variables Vercel. Key ini HANYA
-dipakai server (`/api/story`) — tidak pernah dikirim ke frontend dan
-tidak boleh di-commit ke repo (lihat `.env.example`).
-Perkiraan biaya: gpt-4o-mini ≈ $0,15/1 juta token input +
-$0,60/1 juta token output — satu naskah cerita (3–8 adegan) kira-kira
-$0,001–0,003 (kurang dari Rp50). Cek harga terbaru di
-platform.openai.com. Bila key belum diisi, fitur Cerita menampilkan
-error jelas "OPENAI_API_KEY belum diisi" (bukan crash).
+Penyedia naskah diatur lewat env (route `/api/story` memakai format
+OpenAI chat completions; tanpa env LLM, defaultnya OpenAI):
+
+- **OpenAI** (default): isi `OPENAI_API_KEY` saja. Cara dapat key:
+  [platform.openai.com](https://platform.openai.com) → API keys →
+  Create new secret key. Perkiraan biaya: gpt-4o-mini ≈ $0,15/1 juta
+  token input + $0,60/1 juta token output — satu naskah cerita
+  (3–8 adegan) kira-kira $0,001–0,003 (kurang dari Rp50). Cek harga
+  terbaru di platform.openai.com.
+- **Gemini** (gratis, via endpoint OpenAI-kompatibel Google): isi
+  `LLM_API_KEY` = key Gemini dari [Google AI Studio](https://aistudio.google.com)
+  → Get API key, `LLM_BASE_URL` =
+  `https://generativelanguage.googleapis.com/v1beta/openai`, dan
+  `LLM_MODEL` = `gemini-2.5-flash` (model lain bisa diganti lewat env
+  yang sama). `LLM_API_KEY` didahulukan; bila kosong, route memakai
+  `OPENAI_API_KEY` sebagai fallback.
+
+Key LLM HANYA dipakai server (`/api/story`) — tidak pernah dikirim ke
+frontend dan tidak boleh di-commit ke repo (lihat `.env.example`).
+Bila key belum diisi, fitur Cerita menampilkan error jelas
+"LLM_API_KEY belum diisi" (bukan crash).
 
 ## Setup Supabase
 
@@ -179,7 +192,8 @@ npm run build                # verifikasi build produksi
 3. Isi **Environment Variables** (sama seperti `.env.local`):
    `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
    `SUPABASE_SERVICE_ROLE_KEY`, dan (opsional, hanya untuk fitur
-   Cerita) `OPENAI_API_KEY`.
+   Cerita) `LLM_API_KEY` + `LLM_BASE_URL` + `LLM_MODEL` (Gemini),
+   atau `OPENAI_API_KEY` saja (OpenAI, default).
 4. Deploy. Website + API routes jalan; **worker TIDAK ikut ter-deploy**
    (lihat bawah). Cron harian keep-alive (`vercel.json`) ikut
    ter-deploy otomatis — 1 cron ke `/api/ping` tiap tengah malam UTC.
@@ -215,7 +229,7 @@ src/
       voices/route.ts     GET + POST + DELETE /api/voices (DELETE juga
                           menghapus file referensi + job suara itu)
       jobs/route.ts       GET (full + ?fields=light) + POST + DELETE /api/jobs
-      story/route.ts      POST /api/story (OpenAI tulis naskah → job VO per adegan)
+      story/route.ts      POST /api/story (LLM tulis naskah → job VO per adegan)
       ping/route.ts       GET /api/ping (keep-alive Supabase, query paling ringan)
   lib/supabase.ts         Client browser (anon) + server (service role)
 supabase/schema.sql       Tabel voices + jobs + stories, RLS + policy

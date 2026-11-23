@@ -11,7 +11,7 @@ import { getServiceClient } from "@/lib/supabase";
  *
  * Alur:
  *   1. Validasi ide + suara referensi ada.
- *   2. OpenAI (gpt-4o-mini, response JSON) menulis naskah cerita
+ *   2. LLM (response JSON) menulis naskah cerita
  *      berbahasa yang diminta, dipecah jadi adegan-adegan
  *      (3–8 adegan sesuai durasi target), tiap adegan
  *      { title, narration } — narration = teks VO per adegan
@@ -22,17 +22,41 @@ import { getServiceClient } from "@/lib/supabase";
  *      VoxCPM2 yang memprosesnya seperti job biasa.
  *   5. Kembalikan { storyId, scenes: [{ title, narration, jobId }] }.
  *
- * OpenAI dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2
- * (kloning suara referensi). Key OpenAI HANYA di server (env
- * OPENAI_API_KEY) — tidak pernah dikirim ke frontend.
+ * LLM dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2
+ * (kloning suara referensi). Key LLM HANYA di server (env LLM_API_KEY,
+ * fallback OPENAI_API_KEY) — tidak pernah dikirim ke frontend.
+ * Provider bisa OpenAI (default) atau Gemini lewat endpoint
+ * OpenAI-kompatibel Google — diatur lewat LLM_BASE_URL + LLM_MODEL
+ * (lihat .env.example).
  *
  * Catatan Next.js 16 (cacheComponents aktif): route handler yang memakai
  * `request` sudah dinamis secara default — tanpa `dynamic =
  * 'force-dynamic'` dan tanpa `runtime` segment config.
  */
 
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL = "gpt-4o-mini";
+/**
+ * Penyedia penulis naskah (format OpenAI chat completions).
+ * LLM_API_KEY didahulukan; OPENAI_API_KEY dipakai sebagai fallback supaya
+ * konfigurasi lama tetap jalan. Tanpa LLM_BASE_URL/LLM_MODEL, defaultnya
+ * OpenAI (api.openai.com, gpt-4o-mini).
+ * Untuk Gemini: LLM_API_KEY=<key Gemini dari Google AI Studio>,
+ * LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai,
+ * LLM_MODEL=gemini-2.5-flash
+ */
+const DEFAULT_BASE_URL = "https://api.openai.com/v1";
+const DEFAULT_MODEL = "gpt-4o-mini";
+
+function resolveLlmConfig() {
+  const apiKey =
+    process.env.LLM_API_KEY?.trim() ||
+    process.env.OPENAI_API_KEY?.trim() ||
+    "";
+  const baseUrl = (
+    process.env.LLM_BASE_URL?.trim() || DEFAULT_BASE_URL
+  ).replace(/\/+$/, "");
+  const model = process.env.LLM_MODEL?.trim() || DEFAULT_MODEL;
+  return { apiKey, url: `${baseUrl}/chat/completions`, model };
+}
 
 // Durasi target → jumlah adegan (durasi VO akhir mengikuti panjang
 // narasi yang dihasilkan, bukan angka ini secara kaku).
@@ -62,12 +86,12 @@ export async function POST(req: NextRequest) {
   const supabase = getServiceClient();
   if (!supabase) return serviceUnavailable();
 
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) {
+  const llm = resolveLlmConfig();
+  if (!llm.apiKey) {
     return NextResponse.json(
       {
         error:
-          "OPENAI_API_KEY belum diisi — isi di .env.local (lokal) atau Environment Variables Vercel. Key didapat di platform.openai.com → API keys. Key ini dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2.",
+          "LLM_API_KEY belum diisi — isi di .env.local (lokal) atau Environment Variables Vercel (fallback: OPENAI_API_KEY). Untuk Gemini, key gratis didapat di aistudio.google.com → Get API key, lalu isi juga LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai dan LLM_MODEL=gemini-2.5-flash. Key ini dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2.",
       },
       { status: 503 },
     );
@@ -149,14 +173,14 @@ export async function POST(req: NextRequest) {
 
   let scenes: Scene[];
   try {
-    const openaiRes = await fetch(OPENAI_URL, {
+    const llmRes = await fetch(llm.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${openaiKey}`,
+        Authorization: `Bearer ${llm.apiKey}`,
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
+        model: llm.model,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
@@ -166,10 +190,10 @@ export async function POST(req: NextRequest) {
       }),
     });
 
-    if (!openaiRes.ok) {
+    if (!llmRes.ok) {
       let detail = "";
       try {
-        const errJson = (await openaiRes.json()) as {
+        const errJson = (await llmRes.json()) as {
           error?: { message?: string };
         };
         detail = errJson.error?.message ?? "";
@@ -178,19 +202,19 @@ export async function POST(req: NextRequest) {
       }
       return NextResponse.json(
         {
-          error: `OpenAI menolak permintaan (${openaiRes.status})${detail ? `: ${detail}` : ""} — periksa OPENAI_API_KEY dan saldo akun OpenAI Anda.`,
+          error: `LLM menolak permintaan (${llmRes.status})${detail ? `: ${detail}` : ""} — periksa LLM_API_KEY (atau OPENAI_API_KEY) dan kuota akun LLM Anda.`,
         },
         { status: 502 },
       );
     }
 
-    const openaiData = (await openaiRes.json()) as {
+    const llmData = (await llmRes.json()) as {
       choices?: { message?: { content?: string } }[];
     };
-    const content = openaiData.choices?.[0]?.message?.content ?? "";
+    const content = llmData.choices?.[0]?.message?.content ?? "";
     if (!content) {
       return NextResponse.json(
-        { error: "OpenAI mengembalikan jawaban kosong — coba lagi." },
+        { error: "LLM mengembalikan jawaban kosong — coba lagi." },
         { status: 502 },
       );
     }
@@ -200,14 +224,14 @@ export async function POST(req: NextRequest) {
       parsed = JSON.parse(content) as { scenes?: unknown };
     } catch {
       return NextResponse.json(
-        { error: "OpenAI mengembalikan jawaban yang bukan JSON — coba lagi." },
+        { error: "LLM mengembalikan jawaban yang bukan JSON — coba lagi." },
         { status: 502 },
       );
     }
 
     if (!Array.isArray(parsed.scenes) || parsed.scenes.length === 0) {
       return NextResponse.json(
-        { error: "OpenAI tidak mengembalikan adegan apa pun — coba lagi." },
+        { error: "LLM tidak mengembalikan adegan apa pun — coba lagi." },
         { status: 502 },
       );
     }
@@ -226,14 +250,14 @@ export async function POST(req: NextRequest) {
 
     if (scenes.length === 0) {
       return NextResponse.json(
-        { error: "Adegan dari OpenAI kosong atau tidak valid — coba lagi." },
+        { error: "Adegan dari LLM kosong atau tidak valid — coba lagi." },
         { status: 502 },
       );
     }
   } catch (err) {
     return NextResponse.json(
       {
-        error: `Gagal menghubungi OpenAI: ${err instanceof Error ? err.message : "kesalahan jaringan"}`,
+        error: `Gagal menghubungi LLM: ${err instanceof Error ? err.message : "kesalahan jaringan"}`,
       },
       { status: 502 },
     );
