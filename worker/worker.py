@@ -259,9 +259,11 @@ def process_transcription(supabase, tr: dict) -> None:
     """Transkrip SATU audio dengan faster-whisper (proses fresh).
 
     Audio diunduh dari bucket `transcript-audio` apa adanya (format
-    asli mp3/wav/m4a — faster-whisper membaca lewat ffmpeg/av sendiri,
-    jadi tidak perlu konversi dulu). Hasil JSON transcribe.py
-    (text + segments) disimpan ke baris transcriptions.
+    asli mp3/wav/m4a), lalu transcribe.py mendekodenya ke array
+    float32 mono 16 kHz via ffmpeg sebelum diberikan ke
+    faster-whisper (decode lewat path file crash di PyAV 19.x).
+    Hasil JSON transcribe.py (text + segments) disimpan ke baris
+    transcriptions.
     """
     import json
 
@@ -303,7 +305,10 @@ def process_transcription(supabase, tr: dict) -> None:
                 f"lang={result.get('language')} segs={len(result.get('segments') or [])}"
             )
         except Exception as exc:  # noqa: BLE001 — satu job gagal tidak boleh mematikan worker
-            err = str(exc)[:500]
+            # Simpan EKOR pesan error (bukan kepala): akar masalah ada di
+            # baris terakhir traceback, kepala 500 karakter hanya berisi
+            # "Transkripsi gagal: Traceback..." tanpa penyebabnya.
+            err = str(exc)[-1500:]
             log(f"Transkrip {tr_id}: FAILED — {err}")
             supabase.table("transcriptions").update(
                 {"status": "failed", "error": err}
