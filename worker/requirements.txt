@@ -11,3 +11,8 @@ supabase>=2.0
 voxcpm==2.0.3
 soundfile>=0.12
 numpy>=1.26
+# Transkripsi Whisper (worker/transcribe.py) — model "small", CPU int8.
+# faster-whisper memakai CTranslate2 (bukan torch), jadi tidak bentrok
+# dengan urutan instal torch di README §2; tetap instal SETELAH (c)
+# supaya torchaudio CPU sudah benar dulu.
+faster-whisper>=1.2

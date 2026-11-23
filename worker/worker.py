@@ -1,10 +1,11 @@
-"""Worker VO Studio — polling antrean jobs Supabase, sintesis VoxCPM2.
+"""Worker VO Studio — polling antrean jobs Supabase, sintesis VoxCPM2
++ transkripsi Whisper.
 
 JANGAN jalankan file ini di Vercel (serverless tidak bisa menjalankan
 VoxCPM2: model 4,8 GB, butuh ±6,2 GB RAM). Jalankan di mesin sendiri
 (VPS/server) dengan RAM kosong >= 6,2 GB — lihat worker/README.md.
 
-Alur per job:
+Alur per job VO:
   1. Ambil job tertua status=queued (sekali satu job).
   2. Set status=processing.
   3. Download audio referensi dari bucket `voice-refs`, konversi ke
@@ -17,6 +18,18 @@ Alur per job:
      set status=done + output_path.
   6. Bila gagal: set status=failed + pesan error, lanjut ke job berikut
      (jangan crash loop).
+
+Alur per job TRANSCRIPSI (tabel `transcriptions`):
+  1. Ambil transkripsi tertua status=queued (sekali satu job).
+  2. Set status=processing.
+  3. Download audio dari bucket `transcript-audio`, transkrip dalam
+     PROSES FRESH (subprocess transcribe.py, faster-whisper "small").
+  4. Set status=done + text + segments (jsonb), atau failed + error.
+
+PENTING: worker memproses SATU job dalam satu waktu — JANGAN paralel.
+RAM box 8 GB: VoxCPM butuh ±6,2 GB, faster-whisper small ±1-2 GB;
+keduanya bersamaan = OOM. Tiap iterasi polling: job VO dulu, baru
+transkripsi bila tidak ada VO aktif.
 
 Env yang dibutuhkan (worker/.env atau environment):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
@@ -47,6 +60,7 @@ OUT_SAMPLE_RATE = 48000
 
 WORKER_DIR = Path(__file__).resolve().parent
 SYNTHESIZE_PY = WORKER_DIR / "synthesize.py"
+TRANSCRIBE_PY = WORKER_DIR / "transcribe.py"
 
 
 def log(msg: str) -> None:
@@ -182,7 +196,10 @@ def process_job(supabase, job: dict) -> None:
 
             # --- Download + konversi referensi ---
             ref_bytes = supabase.storage.from_("voice-refs").download(ref_path)
-            ref_src = tmpdir / ("ref" + Path(ref_path).suffix)
+            # Nama sumber HARUS beda dari ref.wav: bila ref_path berekstensi
+            # .wav, "ref" + suffix == "ref.wav" == ref_wav sehingga ffmpeg
+            # menolak (input == output). Pakai "ref-src" agar selalu beda.
+            ref_src = tmpdir / ("ref-src" + Path(ref_path).suffix)
             ref_src.write_bytes(ref_bytes)
             ref_wav = tmpdir / "ref.wav"
             convert_ref_to_wav(ref_src, ref_wav)
@@ -238,6 +255,61 @@ def process_job(supabase, job: dict) -> None:
             ).eq("id", job_id).execute()
 
 
+def process_transcription(supabase, tr: dict) -> None:
+    """Transkrip SATU audio dengan faster-whisper (proses fresh).
+
+    Audio diunduh dari bucket `transcript-audio` apa adanya (format
+    asli mp3/wav/m4a — faster-whisper membaca lewat ffmpeg/av sendiri,
+    jadi tidak perlu konversi dulu). Hasil JSON transcribe.py
+    (text + segments) disimpan ke baris transcriptions.
+    """
+    import json
+
+    tr_id = tr["id"]
+    log(f"Transkrip {tr_id}: mulai ({tr.get('audio_name') or tr['audio_path']})")
+    supabase.table("transcriptions").update({"status": "processing"}).eq("id", tr_id).execute()
+
+    with tempfile.TemporaryDirectory(prefix=f"tr-{tr_id[:8]}-") as tmp:
+        tmpdir = Path(tmp)
+        try:
+            audio_bytes = supabase.storage.from_("transcript-audio").download(tr["audio_path"])
+            audio_src = tmpdir / ("audio" + Path(tr["audio_path"]).suffix)
+            audio_src.write_bytes(audio_bytes)
+
+            out_json = tmpdir / "result.json"
+            language = tr.get("language") or "id"
+            proc = subprocess.run(
+                [
+                    sys.executable, str(TRANSCRIBE_PY),
+                    str(audio_src), language, str(out_json),
+                ],
+                capture_output=True, text=True,
+                env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+            )
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "")[-2000:]
+                raise RuntimeError(f"Transkripsi gagal: {tail}")
+            result = json.loads(out_json.read_text(encoding="utf-8"))
+            supabase.table("transcriptions").update(
+                {
+                    "status": "done",
+                    "text": result.get("text") or "",
+                    "segments": result.get("segments") or [],
+                    "error": None,
+                }
+            ).eq("id", tr_id).execute()
+            log(
+                f"Transkrip {tr_id}: DONE "
+                f"lang={result.get('language')} segs={len(result.get('segments') or [])}"
+            )
+        except Exception as exc:  # noqa: BLE001 — satu job gagal tidak boleh mematikan worker
+            err = str(exc)[:500]
+            log(f"Transkrip {tr_id}: FAILED — {err}")
+            supabase.table("transcriptions").update(
+                {"status": "failed", "error": err}
+            ).eq("id", tr_id).execute()
+
+
 def main() -> None:
     if not SUPABASE_URL or not SERVICE_KEY:
         raise SystemExit("Isi SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di environment.")
@@ -250,6 +322,9 @@ def main() -> None:
     log(f"Worker jalan — polling tiap {POLL_INTERVAL} dtk, model: {MODEL_DIR}")
     while True:
         try:
+            # VO dulu (prioritas): satu job dalam satu waktu, jangan
+            # paralel dengan transkripsi (RAM box 8 GB tidak cukup
+            # untuk VoxCPM ±6,2 GB + faster-whisper sekaligus).
             res = (
                 supabase.table("jobs")
                 .select("id, voice_id, text")
@@ -261,6 +336,19 @@ def main() -> None:
             queued = res.data or []
             if queued:
                 process_job(supabase, queued[0])
+                continue
+            # Tidak ada VO aktif — baru cek antrean transkripsi.
+            res_tr = (
+                supabase.table("transcriptions")
+                .select("id, audio_path, audio_name, language")
+                .eq("status", "queued")
+                .order("created_at")
+                .limit(1)
+                .execute()
+            )
+            queued_tr = res_tr.data or []
+            if queued_tr:
+                process_transcription(supabase, queued_tr[0])
             else:
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:

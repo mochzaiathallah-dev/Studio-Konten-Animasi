@@ -1,9 +1,10 @@
 # Worker VO Studio
 
-Worker Python yang menjalankan sintesis suara VoxCPM2. **Bukan** bagian
-dari deploy Vercel — Vercel hanya menjalankan website + API ringan.
-Worker ini harus jalan di mesin sendiri (VPS/server) dengan
-**RAM kosong ≥ 6,2 GB** (peak RSS sintesis ±6,12 GB, terukur).
+Worker Python yang menjalankan sintesis suara VoxCPM2 **dan** transkripsi
+audio Whisper. **Bukan** bagian dari deploy Vercel — Vercel hanya
+menjalankan website + API ringan. Worker ini harus jalan di mesin
+sendiri (VPS/server) dengan **RAM kosong ≥ 6,2 GB** (peak RSS sintesis
+±6,12 GB, terukur).
 
 ## Cara kerja
 
@@ -16,6 +17,13 @@ Worker ini harus jalan di mesin sendiri (VPS/server) dengan
 4. Gabung chunk (hening 0,25 dtk di antaranya), normalisasi loudnorm
    ke −14 LUFS, upload ke bucket `vo-outputs`, set job `done`.
 5. Bila gagal: job `failed` + pesan error, worker lanjut ke job berikut.
+6. Bila tidak ada job VO yang antre: polling tabel `transcriptions`,
+   ambil yang tertua `status=queued`, download audio dari bucket
+   `transcript-audio`, transkrip dalam proses fresh (`transcribe.py`,
+   faster-whisper model "small"), simpan `text` + `segments` ke baris
+   itu, set `done` (atau `failed` + error). **Satu job dalam satu
+   waktu — VO diprioritaskan; transkripsi tidak pernah jalan paralel
+   dengan sintesis VO** (RAM box 8 GB tidak cukup untuk keduanya).
 
 ## 1. Syarat mesin worker
 
@@ -128,3 +136,42 @@ WantedBy=multi-user.target
   supaya diproses ulang.
 - **Suara hasil tidak mirip** — cek `prompt_text` di tabel `voices`:
   harus PERSIS kalimat yang diucapkan di audio referensi.
+
+## 7. Transkripsi Whisper (tambahan — setelah worker VO jalan)
+
+Transkripsi memakai **faster-whisper** (model Whisper "small",
+CTranslate2, CPU int8 — pola yang terbukti di proyek Ayam Bawang:
+`WhisperModel("small", device="cpu", compute_type="int8")`,
+`vad_filter=True`). Model small butuh RAM ±1–2 GB dan disk ±500 MB.
+
+```sh
+# Di venv worker yang SUDAH ada (box instabox: ~/vo-studio-worker):
+.venv/bin/pip install faster-whisper
+# (sudah ada di requirements.txt — bila instal dari nol,
+#  `pip install -r requirements.txt` sudah mencakupnya.)
+
+# Unduh bobot model small sekali saja (±500 MB; tanpa ini, unduhan
+# terjadi otomatis saat transkripsi pertama jalan):
+python3 - <<'EOF'
+from huggingface_hub import snapshot_download
+snapshot_download("Systran/faster-whisper-small")
+EOF
+```
+
+Setelah itu **restart worker** supaya `worker.py` yang baru (dengan
+polling `transcriptions`) jalan:
+
+```sh
+cd ~/vo-studio-worker
+set -a; . ./.env; set +a
+nohup .venv/bin/python worker.py > worker.log 2>&1 &
+```
+
+Catatan:
+- Worker TIDAK butuh env tambahan untuk transkripsi (model diunduh
+  ke cache Hugging Face biasa). Bahasa "auto" di UI dikirim worker
+  sebagai `language=None` (deteksi otomatis faster-whisper).
+- Transkripsi hanya jalan bila tidak ada job VO yang antre/diproses —
+  VO selalu didahulukan.
+- Uji cepat tanpa website: `python transcribe.py <audio> id /tmp/out.json`
+  lalu cek `/tmp/out.json` berisi `text` + `segments`.

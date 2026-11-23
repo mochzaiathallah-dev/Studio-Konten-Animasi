@@ -6,6 +6,8 @@ import {
   isSupabaseConfigured,
   publicOutputUrl,
   type Job,
+  type Transcription,
+  type TranscriptionSegment,
   type Voice,
 } from "@/lib/supabase";
 import { PADI_LOGO_HEADER } from "@/lib/padi-logo";
@@ -28,10 +30,17 @@ const THEME_OPTIONS: { value: ThemeMode; label: string }[] = [
 /* ------------------------------------------------------------------ */
 /* Mode studio — meniru tab Voice Clone / Voice Design di referensi   */
 /* OmniVoice (aplikasi desktop). Cerita = fitur bang-story yang sudah */
-/* ada. Mode HANYA mengubah kontrol di panel kiri; semua alur simpan  */
-/* ke DB, antrean job, dan worker tetap sama.                          */
+/* ada; Transkrip = fitur Whisper (transkripsi audio → teks + segmen). */
+/* Mode HANYA mengubah kontrol di panel kiri; semua alur simpan ke DB, */
+/* antrean job, dan worker tetap sama.                                */
 /* ------------------------------------------------------------------ */
-type StudioMode = "clone" | "design" | "story";
+type StudioMode = "clone" | "design" | "story" | "transcript";
+
+/* Bahasa transkripsi Whisper: Indonesia (default) atau deteksi otomatis. */
+const TRANSCRIPT_LANGUAGES: { value: string; label: string }[] = [
+  { value: "id", label: "Indonesia" },
+  { value: "auto", label: "Otomatis (deteksi bahasa)" },
+];
 
 /* Atribut Voice Design (panel kanan referensi OmniVoice). Nilainya   */
 /* dirangkai menjadi SATU instruksi gaya berbahasa Inggris di depan   */
@@ -112,6 +121,41 @@ function formatDate(iso: string): string {
   }
 }
 
+/* Detik → "HH:MM:SS,mmm" (format timestamp SRT). */
+function formatSrtTime(seconds: number): string {
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const ms = totalMs % 1000;
+  const totalS = Math.floor(totalMs / 1000);
+  const s = totalS % 60;
+  const m = Math.floor(totalS / 60) % 60;
+  const h = Math.floor(totalS / 3600);
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+}
+
+/* Segmen Whisper → isi file .srt (dibuat client-side). */
+function buildSrt(segments: TranscriptionSegment[]): string {
+  return segments
+    .map(
+      (seg, i) =>
+        `${i + 1}\n${formatSrtTime(seg.start)} --> ${formatSrtTime(seg.end)}\n${seg.text.trim()}\n`,
+    )
+    .join("\n");
+}
+
+/* Unduh teks sebagai file (tanpa request server). */
+function downloadTextFile(filename: string, text: string, mime: string) {
+  const blob = new Blob([text], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export default function Home() {
   const configured = isSupabaseConfigured();
 
@@ -183,12 +227,30 @@ export default function Home() {
   const [creatingStory, setCreatingStory] = useState(false);
   const [storyResult, setStoryResult] = useState<{
     storyId: string;
+    idea?: string;
+    createdAt?: string;
     scenes: { title: string; narration: string; jobId: string }[];
   } | null>(null);
+  // Membedakan "masih memuat" dari "memang kosong": selama fetch awal
+  // belum selesai, daftar menampilkan "Memuat…" — bukan "Belum ada…"
+  // (di halaman baru, daftar sempat tampil 0 sebelum fetch selesai).
+  const [loadingVoices, setLoadingVoices] = useState(configured);
+  const [loadingJobs, setLoadingJobs] = useState(configured);
 
   const [notice, setNotice] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Transkrip (Whisper) — audio → teks + segmen ber-timestamp
+  const [transcriptions, setTranscriptions] = useState<Transcription[]>([]);
+  const [loadingTranscriptions, setLoadingTranscriptions] = useState(configured);
+  const [transcriptFile, setTranscriptFile] = useState<File | null>(null);
+  const [transcriptLanguage, setTranscriptLanguage] = useState("id");
+  const [creatingTranscription, setCreatingTranscription] = useState(false);
+  const [deletingTranscriptionId, setDeletingTranscriptionId] = useState<string | null>(null);
+  const [expandedTranscriptionId, setExpandedTranscriptionId] = useState<string | null>(null);
+  const [copiedTranscriptionId, setCopiedTranscriptionId] = useState<string | null>(null);
+  const transcriptFileInputRef = useRef<HTMLInputElement>(null);
 
   /* Instruksi gaya Voice Design — dirangkai dari atribut di atas. */
   const designPrefix = useMemo(() => {
@@ -205,9 +267,17 @@ export default function Home() {
     try {
       const res = await fetch("/api/voices");
       const data = (await res.json()) as { voices?: Voice[]; error?: string };
-      if (res.ok) setVoices(data.voices ?? []);
+      if (res.ok) {
+        setVoices(data.voices ?? []);
+        // Pilih otomatis suara terbaru bila belum ada yang dipilih —
+        // setelah reload, Generate langsung bisa dipakai tanpa klik
+        // "Pakai suara ini" dulu.
+        setSelectedVoiceId((prev) => prev || data.voices?.[0]?.id || prev);
+      }
     } catch {
       // Biarkan daftar kosong; banner koneksi sudah menjelaskan.
+    } finally {
+      setLoadingVoices(false);
     }
   }, []);
 
@@ -218,6 +288,51 @@ export default function Home() {
       if (res.ok) setJobs(data.jobs ?? []);
     } catch {
       // Biarkan daftar kosong.
+    } finally {
+      setLoadingJobs(false);
+    }
+  }, []);
+
+  // Muat naskah cerita TERAKHIR dari database (tabel stories) — naskah
+  // sebelumnya hanya hidup di state sesi, jadi hilang setelah reload
+  // padahal sudah tersimpan. Job per adegan dicocokkan lewat teks
+  // narasi (job cerita punya text == narration adegan).
+  const loadLatestStory = useCallback(async () => {
+    try {
+      const res = await fetch("/api/story?limit=1");
+      const data = (await res.json()) as {
+        stories?: {
+          id: string;
+          idea: string;
+          duration_target: string;
+          script: { title: string; narration: string }[];
+          created_at: string;
+        }[];
+        error?: string;
+      };
+      if (!res.ok) return;
+      const latest = data.stories?.[0];
+      if (!latest || !Array.isArray(latest.script)) return;
+      const scenes = latest.script
+        .filter(
+          (s) =>
+            s && typeof s.title === "string" && typeof s.narration === "string",
+        )
+        .map((s) => ({ title: s.title, narration: s.narration, jobId: "" }));
+      if (scenes.length === 0) return;
+      // Jangan timpa naskah yang baru saja dibuat di sesi ini.
+      setStoryResult((prev) =>
+        prev
+          ? prev
+          : {
+              storyId: latest.id,
+              idea: latest.idea,
+              createdAt: latest.created_at,
+              scenes,
+            },
+      );
+    } catch {
+      // Abaikan — naskah sesi ini tetap tampil bila ada.
     }
   }, []);
 
@@ -248,6 +363,50 @@ export default function Home() {
     }
   }, []);
 
+  const loadTranscriptions = useCallback(async () => {
+    try {
+      const res = await fetch("/api/transcriptions");
+      const data = (await res.json()) as {
+        transcriptions?: Transcription[];
+        error?: string;
+      };
+      if (res.ok) setTranscriptions(data.transcriptions ?? []);
+    } catch {
+      // Biarkan daftar kosong.
+    } finally {
+      setLoadingTranscriptions(false);
+    }
+  }, []);
+
+  // Poll RINGAN status transkripsi (pola sama seperti job VO): hanya
+  // saat ada transkripsi aktif, tiap 3 detik. Mode light membawa
+  // text + segments supaya teks langsung tampil begitu status done,
+  // tanpa memuat ulang daftar penuh.
+  const loadTranscriptionStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/transcriptions?fields=light");
+      const data = (await res.json()) as {
+        transcriptions?: Pick<
+          Transcription,
+          "id" | "status" | "text" | "segments" | "error"
+        >[];
+        error?: string;
+      };
+      if (!res.ok) return;
+      const updates = new Map((data.transcriptions ?? []).map((t) => [t.id, t]));
+      setTranscriptions((prev) =>
+        prev.map((t) => {
+          const u = updates.get(t.id);
+          return u
+            ? { ...t, status: u.status, text: u.text, segments: u.segments, error: u.error }
+            : t;
+        }),
+      );
+    } catch {
+      // Abaikan — poll berikutnya mencoba lagi.
+    }
+  }, []);
+
   useEffect(() => {
     if (!configured) return;
     // Muat data awal setelah mount — di callback microtask, bukan
@@ -256,16 +415,45 @@ export default function Home() {
     void Promise.resolve().then(() => {
       loadVoices();
       loadJobs();
+      loadLatestStory();
+      loadTranscriptions();
     });
-  }, [configured, loadVoices, loadJobs]);
+  }, [configured, loadVoices, loadJobs, loadLatestStory, loadTranscriptions]);
+
+  // Adegan cerita + jobId-nya (dicocokkan dari daftar job lewat teks
+  // narasi — job cerita punya text == narration adegan). Dihitung
+  // saat render, bukan disimpan di state, supaya tidak ada efek yang
+  // menulis state (aturan react-hooks/set-state-in-effect).
+  const storyScenes = useMemo(() => {
+    if (!storyResult) return [];
+    return storyResult.scenes.map((s) => ({
+      ...s,
+      jobId: s.jobId || jobs.find((j) => j.text === s.narration)?.id || "",
+    }));
+  }, [storyResult, jobs]);
 
   // Poll status job tiap 3 detik selama ada job yang masih antre/diproses.
   const hasActiveJob = jobs.some((j) => j.status === "queued" || j.status === "processing");
+  const hasProcessingJob = jobs.some((j) => j.status === "processing");
   useEffect(() => {
     if (!configured || !hasActiveJob) return;
     const t = setInterval(loadJobStatus, 3000);
     return () => clearInterval(t);
   }, [configured, hasActiveJob, loadJobStatus]);
+
+  // Poll status transkripsi tiap 3 detik selama ada yang masih
+  // antre/diproses (pola sama seperti job VO).
+  const hasActiveTranscription = transcriptions.some(
+    (t) => t.status === "queued" || t.status === "processing",
+  );
+  const hasProcessingTranscription = transcriptions.some(
+    (t) => t.status === "processing",
+  );
+  useEffect(() => {
+    if (!configured || !hasActiveTranscription) return;
+    const t = setInterval(loadTranscriptionStatus, 3000);
+    return () => clearInterval(t);
+  }, [configured, hasActiveTranscription, loadTranscriptionStatus]);
 
   async function handleSaveVoice(e: React.FormEvent) {
     e.preventDefault();
@@ -467,6 +655,102 @@ export default function Home() {
     }
   }
 
+  async function handleCreateTranscription(e: React.FormEvent) {
+    e.preventDefault();
+    setNotice(null);
+    if (!transcriptFile) {
+      setNotice({ kind: "err", text: "Pilih dulu file audio yang mau ditranskrip." });
+      return;
+    }
+    const client = getBrowserClient();
+    if (!client) {
+      setNotice({ kind: "err", text: "Supabase belum terhubung." });
+      return;
+    }
+    setCreatingTranscription(true);
+    try {
+      const ext = transcriptFile.name.split(".").pop()?.toLowerCase() || "mp3";
+      const audioPath = `uploads/${crypto.randomUUID()}.${ext}`;
+      const { error: uploadError } = await client.storage
+        .from("transcript-audio")
+        .upload(audioPath, transcriptFile, {
+          contentType: transcriptFile.type || "audio/mpeg",
+          upsert: false,
+        });
+      if (uploadError) throw new Error(`Gagal mengunggah audio: ${uploadError.message}`);
+
+      const res = await fetch("/api/transcriptions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio_path: audioPath,
+          audio_name: transcriptFile.name,
+          language: transcriptLanguage,
+        }),
+      });
+      const data = (await res.json()) as {
+        transcription?: Transcription;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(data.error ?? "Gagal membuat transkripsi.");
+
+      setNotice({
+        kind: "ok",
+        text: "Transkripsi dibuat dan masuk antrean. Worker akan mentranskripnya — status diperbarui otomatis.",
+      });
+      setTranscriptFile(null);
+      if (transcriptFileInputRef.current) transcriptFileInputRef.current.value = "";
+      await loadTranscriptions();
+    } catch (err) {
+      setNotice({
+        kind: "err",
+        text: err instanceof Error ? err.message : "Terjadi kesalahan.",
+      });
+    } finally {
+      setCreatingTranscription(false);
+    }
+  }
+
+  async function handleDeleteTranscription(id: string) {
+    setDeletingTranscriptionId(id);
+    try {
+      const res = await fetch(`/api/transcriptions/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok) throw new Error(data.error ?? "Gagal menghapus transkripsi.");
+      setTranscriptions((prev) => prev.filter((t) => t.id !== id));
+    } catch (err) {
+      setNotice({
+        kind: "err",
+        text: err instanceof Error ? err.message : "Terjadi kesalahan.",
+      });
+    } finally {
+      setDeletingTranscriptionId(null);
+    }
+  }
+
+  async function handleCopyTranscription(id: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback bila clipboard API diblokir (mis. konteks non-HTTPS):
+      // pilih lewat textarea sementara lalu salin.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopiedTranscriptionId(id);
+    window.setTimeout(() => {
+      setCopiedTranscriptionId((prev) => (prev === id ? null : prev));
+    }, 2000);
+  }
+
   const wordCount = voText.trim() ? voText.trim().split(/\s+/).length : 0;
   const selectedVoice = voices.find((v) => v.id === selectedVoiceId);
   const latestJob = jobs[0] ?? null;
@@ -571,10 +855,15 @@ export default function Home() {
             <span className="font-semibold">✓ Sistem siap.</span>{" "}
             Supabase terhubung, semua suara / job / cerita tersimpan di
             database.{" "}
-            {hasActiveJob ? (
+            {hasProcessingJob || hasProcessingTranscription ? (
               <span>Ada job yang sedang diproses worker — status diperbarui otomatis.</span>
+            ) : hasActiveJob || hasActiveTranscription ? (
+              <span>
+                Ada job yang antre — menunggu worker berjalan (sintesis dan
+                transkripsi bukan di Vercel).
+              </span>
             ) : (
-              <span>Worker VoxCPM2 memproses job saat aktif (sintesis bukan di Vercel).</span>
+              <span>Worker memproses job saat aktif (sintesis &amp; transkripsi bukan di Vercel).</span>
             )}
           </section>
         )}
@@ -674,7 +963,11 @@ export default function Home() {
                 <h3 className="text-sm font-semibold">
                   Suara tersimpan ({voices.length})
                 </h3>
-                {voices.length === 0 ? (
+                {loadingVoices ? (
+                  <p className="mt-2 text-sm" style={{ color: "var(--muted)" }}>
+                    Memuat daftar suara…
+                  </p>
+                ) : voices.length === 0 ? (
                   <p className="mt-2 text-sm" style={{ color: "var(--muted)" }}>
                     Belum ada suara. Simpan satu suara referensi dulu.
                   </p>
@@ -719,7 +1012,7 @@ export default function Home() {
               </div>
             </section>
 
-            {/* 2 — Studio: Voice Clone / Voice Design / Cerita */}
+            {/* 2 — Studio: Voice Clone / Voice Design / Cerita / Transkrip */}
             <section className="card p-5">
               <h2 className="text-lg font-semibold">🎛️ Studio</h2>
               <p className="mt-1 text-sm" style={{ color: "var(--muted)" }}>
@@ -760,6 +1053,15 @@ export default function Home() {
                   className={`tab-btn ${mode === "story" ? "active" : ""}`}
                 >
                   📖 Cerita
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "transcript"}
+                  onClick={() => setMode("transcript")}
+                  className={`tab-btn ${mode === "transcript" ? "active" : ""}`}
+                >
+                  📝 Transkrip
                 </button>
               </div>
 
@@ -1011,13 +1313,26 @@ export default function Home() {
                 </form>
               )}
 
-              {mode === "story" && storyResult && storyResult.scenes.length > 0 && (
+              {mode === "story" && storyResult && storyScenes.length > 0 && (
                 <div className="mt-6">
                   <h3 className="text-sm font-semibold">
-                    Naskah — {storyResult.scenes.length} adegan
+                    Naskah — {storyScenes.length} adegan
                   </h3>
+                  {storyResult.idea && (
+                    <p className="mt-1 text-sm" style={{ color: "var(--muted)" }}>
+                      Ide: “{storyResult.idea}”
+                      {storyResult.createdAt
+                        ? ` · ${formatDate(storyResult.createdAt)}`
+                        : ""}
+                    </p>
+                  )}
+                  {storyResult.createdAt && (
+                    <p className="mt-1 text-xs" style={{ color: "var(--faint)" }}>
+                      Tersimpan di database — tetap tampil setelah reload.
+                    </p>
+                  )}
                   <ol className="mt-2 space-y-3">
-                    {storyResult.scenes.map((s, i) => (
+                    {storyScenes.map((s, i) => (
                       <li
                         key={s.jobId || i}
                         className="rounded-lg border p-3 text-sm"
@@ -1033,6 +1348,221 @@ export default function Home() {
                       </li>
                     ))}
                   </ol>
+                </div>
+              )}
+
+              {/* --- Transkrip (Whisper) --- */}
+              {mode === "transcript" && (
+                <div className="mt-4 space-y-4">
+                  <p className="text-sm" style={{ color: "var(--muted)" }}>
+                    Unggah audio (rekaman, VO, wawancara) — worker di box
+                    mentranskripnya dengan Whisper (faster-whisper, model
+                    small). Hasilnya teks lengkap + segmen ber-timestamp,
+                    bisa disalin dan diunduh .txt/.srt.
+                  </p>
+                  <form onSubmit={handleCreateTranscription} className="space-y-4">
+                    <div>
+                      <label className="label" htmlFor="transcript-audio">File audio</label>
+                      <input
+                        id="transcript-audio"
+                        ref={transcriptFileInputRef}
+                        type="file"
+                        accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac"
+                        disabled={!configured || creatingTranscription}
+                        onChange={(e) => {
+                          const f = e.target.files?.[0] ?? null;
+                          if (f && f.size > MAX_AUDIO_BYTES) {
+                            setNotice({
+                              kind: "err",
+                              text: "File audio maksimal 10 MB — potong dulu audionya.",
+                            });
+                            e.target.value = "";
+                            return;
+                          }
+                          setTranscriptFile(f);
+                        }}
+                        className="input"
+                      />
+                      {transcriptFile && (
+                        <p className="hint">
+                          Dipilih: {transcriptFile.name} ({(transcriptFile.size / 1024).toFixed(0)} KB)
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="label" htmlFor="transcript-language">Bahasa audio</label>
+                      <select
+                        id="transcript-language"
+                        value={transcriptLanguage}
+                        disabled={!configured || creatingTranscription}
+                        onChange={(e) => setTranscriptLanguage(e.target.value)}
+                        className="select"
+                      >
+                        {TRANSCRIPT_LANGUAGES.map((o) => (
+                          <option key={o.value} value={o.value}>{o.label}</option>
+                        ))}
+                      </select>
+                      <p className="hint">
+                        Pilih “Otomatis” bila bahasanya campuran atau tidak yakin.
+                      </p>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={!configured || creatingTranscription || !transcriptFile}
+                      className="btn-primary w-full py-3 text-base"
+                    >
+                      {creatingTranscription ? "Mengunggah…" : "📝 Buat Transkrip"}
+                    </button>
+                  </form>
+
+                  <div className="mt-6">
+                    <h3 className="text-sm font-semibold">
+                      Hasil transkripsi ({transcriptions.length})
+                    </h3>
+                    {loadingTranscriptions ? (
+                      <p className="mt-2 text-sm" style={{ color: "var(--muted)" }}>
+                        Memuat hasil transkripsi…
+                      </p>
+                    ) : transcriptions.length === 0 ? (
+                      <p className="mt-2 text-sm" style={{ color: "var(--muted)" }}>
+                        Belum ada transkripsi. Unggah satu audio di atas.
+                      </p>
+                    ) : (
+                      <ul className="mt-2 space-y-3">
+                        {transcriptions.map((tr) => {
+                          const expanded = expandedTranscriptionId === tr.id;
+                          const preview = tr.text ?? "";
+                          const shown =
+                            expanded || preview.length <= 300
+                              ? preview
+                              : `${preview.slice(0, 300)}…`;
+                          const baseName = (tr.audio_name ?? "transkrip").replace(
+                            /\.[^.]+$/,
+                            "",
+                          );
+                          return (
+                            <li
+                              key={tr.id}
+                              className="rounded-lg border p-3 text-sm"
+                              style={{ borderColor: "var(--border)" }}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <p className="font-medium break-words">
+                                    {tr.audio_name ?? "Audio"} · {formatDate(tr.created_at)}
+                                  </p>
+                                  <p className="text-xs" style={{ color: "var(--faint)" }}>
+                                    Bahasa:{" "}
+                                    {tr.language === "auto"
+                                      ? "Otomatis"
+                                      : tr.language === "id"
+                                        ? "Indonesia"
+                                        : tr.language}{" "}
+                                    · Model Whisper {tr.model}
+                                  </p>
+                                </div>
+                                <span className={STATUS_BADGE[tr.status]}>
+                                  {STATUS_LABEL[tr.status]}
+                                </span>
+                              </div>
+                              {tr.status === "failed" && tr.error && (
+                                <p
+                                  className="mt-2 break-words"
+                                  style={{ color: "var(--err-text)" }}
+                                >
+                                  Gagal: {tr.error}
+                                </p>
+                              )}
+                              {tr.status === "done" && tr.text && (
+                                <div className="mt-2">
+                                  <p
+                                    className="break-words whitespace-pre-wrap"
+                                    style={{ color: "var(--muted)" }}
+                                  >
+                                    {shown}
+                                  </p>
+                                  {preview.length > 300 && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setExpandedTranscriptionId(expanded ? null : tr.id)
+                                      }
+                                      className="btn-secondary mt-2"
+                                    >
+                                      {expanded ? "Tutup" : "Lihat selengkapnya"}
+                                    </button>
+                                  )}
+                                  {expanded && tr.segments && tr.segments.length > 0 && (
+                                    <ol
+                                      className="mt-3 space-y-1 text-xs"
+                                      style={{ color: "var(--faint)" }}
+                                    >
+                                      {tr.segments.map((seg, i) => (
+                                        <li key={i}>
+                                          [{formatSrtTime(seg.start)} → {formatSrtTime(seg.end)}]{" "}
+                                          {seg.text.trim()}
+                                        </li>
+                                      ))}
+                                    </ol>
+                                  )}
+                                  <div className="mt-3 flex flex-wrap gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleCopyTranscription(tr.id, tr.text ?? "")
+                                      }
+                                      className="btn-secondary"
+                                    >
+                                      {copiedTranscriptionId === tr.id
+                                        ? "✓ Disalin"
+                                        : "📋 Salin teks"}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        downloadTextFile(
+                                          `${baseName}.txt`,
+                                          tr.text ?? "",
+                                          "text/plain",
+                                        )
+                                      }
+                                      className="btn-secondary"
+                                    >
+                                      ⬇️ Unduh .txt
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={!tr.segments || tr.segments.length === 0}
+                                      onClick={() =>
+                                        downloadTextFile(
+                                          `${baseName}.srt`,
+                                          buildSrt(tr.segments ?? []),
+                                          "text/plain",
+                                        )
+                                      }
+                                      className="btn-secondary disabled:opacity-50"
+                                    >
+                                      ⬇️ Unduh .srt
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteTranscription(tr.id)}
+                                disabled={deletingTranscriptionId === tr.id}
+                                className="btn-danger-text mt-2 disabled:opacity-50"
+                              >
+                                {deletingTranscriptionId === tr.id
+                                  ? "Menghapus…"
+                                  : "Hapus transkripsi"}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </div>
                 </div>
               )}
             </section>
@@ -1053,8 +1583,9 @@ export default function Home() {
 
               {!latestJob ? (
                 <p className="mt-3 text-sm" style={{ color: "var(--muted)" }}>
-                  Belum ada hasil. Buat VO pertama Anda di panel Studio —
-                  hasilnya muncul di sini begitu worker selesai.
+                  {loadingJobs
+                    ? "Memuat hasil…"
+                    : "Belum ada hasil. Buat VO pertama Anda di panel Studio — hasilnya muncul di sini begitu worker selesai."}
                 </p>
               ) : (
                 <div className="mt-3">
@@ -1129,7 +1660,7 @@ export default function Home() {
             <section className="card p-5">
               <h2 className="text-base font-semibold">⚙️ Parameter Karakter Vokal Aktif</h2>
               <ul className="mt-3 space-y-1.5 text-sm" style={{ color: "var(--muted)" }}>
-                <li>• Mode: {mode === "clone" ? "Voice Clone" : mode === "design" ? "Voice Design" : "Cerita"}</li>
+                <li>• Mode: {mode === "clone" ? "Voice Clone" : mode === "design" ? "Voice Design" : mode === "story" ? "Cerita" : "Transkrip"}</li>
                 <li>• Suara referensi: {selectedVoice ? selectedVoice.name : "— belum dipilih —"}</li>
                 {mode === "design" && (
                   <>
@@ -1161,7 +1692,11 @@ export default function Home() {
                   Muat ulang
                 </button>
               </div>
-              {jobs.length === 0 ? (
+              {loadingJobs ? (
+                <p className="mt-3 text-sm" style={{ color: "var(--muted)" }}>
+                  Memuat hasil…
+                </p>
+              ) : jobs.length === 0 ? (
                 <p className="mt-3 text-sm" style={{ color: "var(--muted)" }}>
                   Belum ada job VO. Buat VO pertama Anda di panel Studio.
                 </p>

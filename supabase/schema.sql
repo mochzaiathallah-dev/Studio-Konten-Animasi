@@ -7,6 +7,8 @@
 --   jobs    — antrean generate VO (hasil di Storage bucket vo-outputs)
 --   stories — naskah cerita per adegan (ditulis OpenAI; tiap adegan
 --              dibuatkan 1 job VO di tabel jobs)
+--   transcriptions — antrean transkrip audio Whisper (teks + segmen
+--              ber-timestamp; audio di Storage bucket transcript-audio)
 --
 -- CATATAN KEAMANAN (baca dulu):
 -- Aplikasi ini dirancang sebagai ALAT PRIBADI (satu pengguna), bukan
@@ -71,6 +73,39 @@ create table if not exists public.stories (
 create index if not exists stories_created_idx
   on public.stories (created_at);
 
+-- --------------------- transcriptions ---------------------
+-- Transkripsi audio (Whisper, worker di box) — arsitektur sama
+-- seperti jobs: browser mengunggah audio ke bucket `transcript-audio`,
+-- lalu membuat baris status=queued; worker mem-polling, mentranskrip
+-- dengan faster-whisper model "small", lalu mengisi text + segments.
+-- segments: [{ "start": 0.0, "end": 3.5, "text": "..." }, ...]
+-- (waktu dalam detik; dipakai UI untuk unduh .srt).
+create table if not exists public.transcriptions (
+  id uuid primary key default gen_random_uuid(),
+  -- path file di bucket Storage `transcript-audio`,
+  -- mis. "uploads/<uuid>.mp3"
+  audio_path text not null,
+  -- nama file asli (untuk tampilan di daftar hasil)
+  audio_name text,
+  -- model Whisper yang dipakai worker, default 'small'
+  model text not null default 'small',
+  -- kode bahasa faster-whisper: 'id' (Indonesia, default) atau
+  -- 'auto' (deteksi otomatis oleh worker — dikirim sebagai None)
+  language text not null default 'id',
+  status text not null default 'queued'
+    check (status in ('queued', 'processing', 'done', 'failed')),
+  -- teks transkrip lengkap (null sampai status = 'done')
+  text text,
+  -- segmen ber-timestamp (jsonb, null sampai status = 'done')
+  segments jsonb,
+  -- pesan error bila status = 'failed'
+  error text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists transcriptions_status_created_idx
+  on public.transcriptions (status, created_at);
+
 -- --------------------------- RLS --------------------------
 -- RLS AKTIF di kedua tabel (wajib supaya policy berlaku).
 alter table public.voices enable row level security;
@@ -92,6 +127,12 @@ drop policy if exists "stories_all_anon" on public.stories;
 create policy "stories_all_anon" on public.stories
   for all to anon, authenticated using (true) with check (true);
 
+alter table public.transcriptions enable row level security;
+
+drop policy if exists "transcriptions_all_anon" on public.transcriptions;
+create policy "transcriptions_all_anon" on public.transcriptions
+  for all to anon, authenticated using (true) with check (true);
+
 -- ------------------------- bucket -------------------------
 -- Bucket dibuat lewat Dashboard → Storage (bukan lewat SQL):
 --   1. Bucket `voice-refs`  — PRIVATE (audio referensi, jangan publik).
@@ -99,6 +140,9 @@ create policy "stories_all_anon" on public.stories
 --      biarkan "Public bucket" MATI.
 --   2. Bucket `vo-outputs`  — PUBLIC (hasil VO diputar/diunduh web).
 --      New bucket → nama "vo-outputs", nyalakan "Public bucket".
+--   3. Bucket `transcript-audio` — PRIVATE (audio yang ditranskrip).
+--      New bucket → nama "transcript-audio", biarkan "Public bucket"
+--      MATI. Audio di sini hanya diunduh worker (service role).
 -- Policy Storage di bawah ini WAJIB dijalankan (RLS aktif di
 -- storage.objects dan TIDAK ada policy bawaan — tanpa ini, upload
 -- audio dari browser ditolak "new row violates row-level security
@@ -120,3 +164,16 @@ create policy "vo_outputs_select_anon" on storage.objects
   using (bucket_id = 'vo-outputs');
 -- Upload/update/delete di vo-outputs hanya lewat service role
 -- (worker) — service role bypass RLS, jadi tidak butuh policy.
+
+-- Upload audio transkripsi dari browser (pola sama seperti voice-refs).
+drop policy if exists "transcript_audio_insert_anon" on storage.objects;
+create policy "transcript_audio_insert_anon" on storage.objects
+  for insert to anon, authenticated
+  with check (bucket_id = 'transcript-audio');
+
+drop policy if exists "transcript_audio_select_anon" on storage.objects;
+create policy "transcript_audio_select_anon" on storage.objects
+  for select to anon, authenticated
+  using (bucket_id = 'transcript-audio');
+-- Hapus file audio transkripsi hanya lewat service role (API DELETE) —
+-- service role bypass RLS, jadi tidak butuh policy delete.

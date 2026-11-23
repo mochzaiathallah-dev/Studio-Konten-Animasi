@@ -3,6 +3,9 @@
 Website untuk membuat voice-over (VO) dengan suara Anda sendiri —
 **kloning suara VoxCPM2**: unggah audio referensi + tulis kalimat
 persisnya, tulis teks VO, generate, dengarkan dan unduh hasilnya.
+Plus tab **Transkrip**: ubah audio jadi teks dengan Whisper
+(faster-whisper, worker yang sama), lengkap dengan segmen
+ber-timestamp dan unduhan .txt/.srt.
 
 Bahasa UI: Indonesia. Stack: Next.js 16 (App Router, TypeScript,
 Tailwind v4) + Supabase (database + Storage) + worker Python terpisah.
@@ -11,16 +14,18 @@ Tailwind v4) + Supabase (database + Storage) + worker Python terpisah.
 
 ```
 Browser ──► Vercel (Next.js: halaman + API routes ringan)
-               │  baca/tulis tabel voices + jobs (service role key)
+               │  baca/tulis tabel voices + jobs + transcriptions (service role key)
                ▼
-           Supabase ──► tabel voices, jobs, stories
+           Supabase ──► tabel voices, jobs, stories, transcriptions
                      ──► Storage: bucket voice-refs (private)
                                   bucket vo-outputs (public)
-               ▲  polling jobs status=queued (tiap 10 dtk)
+                                  bucket transcript-audio (private)
+               ▲  polling jobs + transcriptions status=queued (tiap 10 dtk)
                │  cron harian → GET /api/ping (keep-alive, 1×/hari)
                │
            Worker Python (MESIN SENDIRI, bukan Vercel)
                │  download ref → sintesis VoxCPM2 → upload hasil
+               │  download audio → transkrip faster-whisper → simpan teks
                ▼  update status job done/failed
 ```
 
@@ -28,7 +33,9 @@ Browser ──► Vercel (Next.js: halaman + API routes ringan)
 dan butuh ±6,2 GB RAM saat jalan — jauh di atas limit serverless
 Vercel. Karena itu sintesis dikerjakan worker Python terpisah di
 mesin dengan RAM besar (VPS/server sendiri). Website hanya mengatur
-antrean job; worker yang mengeksekusinya.
+antrean job; worker yang mengeksekusinya. Hal yang sama berlaku untuk
+transkripsi Whisper: modelnya jalan di worker yang sama (bukan di
+Vercel), dengan faster-whisper model "small" (±1–2 GB RAM).
 
 ## Fitur
 
@@ -45,7 +52,7 @@ antrean job; worker yang mengeksekusinya.
 - **Layout studio 2 kolom** — kiri: kontrol (Suara Referensi + Studio);
   kanan (menempel): Hasil Sintesis Audio + Parameter Karakter Vokal Aktif
   + daftar Hasil. Di layar kecil kolom menumpuk rapi.
-- **Tab Voice Clone / Voice Design / Cerita** (seperti tab di OmniVoice):
+- **Tab Voice Clone / Voice Design / Cerita / Transkrip** (seperti tab di OmniVoice):
   - **Voice Clone** — kloning apa adanya (ultimate cloning VoxCPM2).
   - **Voice Design** — rancang karakter suara di atas suara referensi:
     Gender, Usia, Pitch, Gaya Vokal, Dialek/Aksen Indonesia (10 pilihan),
@@ -58,6 +65,10 @@ antrean job; worker yang mengeksekusinya.
   - **Cerita** — sama seperti sebelumnya (LLM tulis naskah per adegan
     → tiap adegan jadi job VO VoxCPM; OpenAI atau Gemini, lihat
     "Cerita" di bawah).
+  - **Transkrip** — unggah audio lalu ditranskrip worker dengan Whisper
+    (faster-whisper, model "small"): teks lengkap + segmen
+    ber-timestamp, bisa disalin dan diunduh .txt/.srt. Bahasa: Indonesia
+    atau Otomatis (deteksi bahasa). Lihat "Transkrip (Whisper)" di bawah.
 - **Hapus suara** (baru, melengkapi CRUD) — tombol "Hapus suara" di tiap
   suara tersimpan: menghapus row di tabel `voices`, file referensi di
   bucket `voice-refs`, dan (lewat FK cascade) semua job VO suara itu
@@ -70,12 +81,13 @@ antrean job; worker yang mengeksekusinya.
   cfg 2.0, seed 42, WAV 48 kHz, −14 LUFS).
 
 Yang SENGAJA TIDAK disalin dari OmniVoice (supaya tidak ada fitur palsu):
-tombol "Auto-Transkrip (Whisper ASR)" — butuh model Whisper + endpoint
-baru, belum ada; chip simbol non-verbal (tawa, helaan napas, dsb.) —
-VoxCPM tidak menjamin memahaminya sebagai efek suara; dan instalasi
-model lokal / auto-install komponen — web Vercel tidak bisa menjalankan
-model (sintesis tetap di worker terpisah). Ketiganya bisa ditambah nanti
-bila diminta, dengan endpoint + worker yang sesuai.
+chip simbol non-verbal (tawa, helaan napas, dsb.) — VoxCPM tidak
+menjamin memahaminya sebagai efek suara; dan instalasi model lokal /
+auto-install komponen — web Vercel tidak bisa menjalankan model
+(sintesis tetap di worker terpisah). Keduanya bisa ditambah nanti bila
+diminta, dengan endpoint + worker yang sesuai. (Tombol "Auto-Transkrip
+(Whisper ASR)" yang dulu masuk daftar ini SUDAH DIBANGUN — lihat
+"Transkrip (Whisper)" di bawah.)
 
 1. **Suara Referensi** — upload audio (mp3/wav/m4a, ≤10 MB, disarankan
    ≤30 detik), beri nama, isi teks prompt (kalimat persis di audio —
@@ -102,6 +114,18 @@ bila diminta, dengan endpoint + worker yang sesuai.
 5. **Layar status koneksi** — bila env Supabase belum diisi, aplikasi
    menampilkan peringatan jelas + langkah setup, dan form generate
    dinonaktifkan (aplikasi tetap bisa dibuka).
+6. **Transkrip (Whisper)** — unggah audio (mp3/wav/m4a, ≤10 MB) + pilih
+   bahasa (Indonesia / Otomatis), lalu "Buat Transkrip": file diunggah
+   langsung dari browser ke bucket `transcript-audio` (private), baris
+   dibuat di tabel `transcriptions` (`status=queued`), worker di box
+   mentranskrip dengan faster-whisper model "small" (CPU int8,
+   `vad_filter=True`) dan mengisi `text` + `segments` (jsonb,
+   start/end dalam detik). Hasil tampil di tab Transkrip: pratinjau
+   teks (bisa dibuka penuh + segmen ber-timestamp), tombol Salin teks,
+   Unduh .txt, dan Unduh .srt (dibuat client-side dari segments) —
+   plus hapus transkripsi (row + file audio). Status diperbarui
+   otomatis HANYA saat ada transkripsi aktif (polling ringan tiap
+   3 detik, `GET /api/transcriptions?fields=light`).
 
 ## Keep-alive + hemat kuota (free plan)
 
@@ -123,9 +147,13 @@ harian. Aplikasi ini dirancang supaya tidak menggerus kuota itu:
   job berstatus `queued`/`processing` — interval 3 detik, lewat
   `GET /api/jobs?fields=light` yang hanya mengambil
   `id, status, output_path, error` (tanpa teks/nama suara, tiap
-  respons <1 KB). Begitu semua job `done`/`failed`, polling
-  berhenti otomatis. Bila tidak ada job aktif, tidak ada polling
-  sama sekali — jadi membuka website saja TIDAK memakan kuota.
+  respons <1 KB). Pola yang sama untuk transkripsi aktif:
+  `GET /api/transcriptions?fields=light` (`id, status, text,
+  segments, error` — teks dibawa supaya langsung tampil begitu
+  selesai, tanpa memuat ulang daftar penuh). Begitu semua job
+  `done`/`failed`, polling berhenti otomatis. Bila tidak ada job
+  aktif, tidak ada polling sama sekali — jadi membuka website saja
+  TIDAK memakan kuota.
 - **Tanpa realtime/WebSocket** — sengaja, supaya tidak ada koneksi
   yang terus-menerus hidup.
 
@@ -169,16 +197,18 @@ Bila key belum diisi, fitur Cerita menampilkan error jelas
 
 1. Buat project di [supabase.com](https://supabase.com) (free tier cukup).
 2. Buka **SQL Editor** → jalankan isi `supabase/schema.sql`
-   (tabel `voices` + `jobs` + `stories`, RLS aktif + policy permissive untuk
-   alat pribadi — baca komentar keamanan di file itu — plus policy
-   Storage untuk bucket di bawah. Tanpa policy Storage, upload audio
-   dari browser ditolak "new row violates row-level security policy".
-   Bila schema.sql sudah pernah dijalankan sebelum policy Storage
-   ditambahkan, jalankan ulang file ini sekali — semua perintahnya
-   idempotent).
-3. Buka **Storage** → buat 2 bucket:
+   (tabel `voices` + `jobs` + `stories` + `transcriptions`, RLS aktif
+   + policy permissive untuk alat pribadi — baca komentar keamanan di
+   file itu — plus policy Storage untuk bucket di bawah. Tanpa policy
+   Storage, upload audio dari browser ditolak "new row violates
+   row-level security policy". Bila schema.sql sudah pernah dijalankan
+   sebelum policy Storage ditambahkan, jalankan ulang file ini sekali
+   — semua perintahnya idempotent).
+3. Buka **Storage** → buat 3 bucket:
    - `voice-refs` — **private** (audio referensi).
    - `vo-outputs` — **public** (hasil VO diputar/diunduh web).
+   - `transcript-audio` — **private** (audio yang ditranskrip;
+     hanya worker yang mengunduhnya).
 4. Salin dari **Settings → API**: Project URL, `anon public` key,
    `service_role` key.
 
@@ -235,14 +265,17 @@ src/
       voices/route.ts     GET + POST + DELETE /api/voices (DELETE juga
                           menghapus file referensi + job suara itu)
       jobs/route.ts       GET (full + ?fields=light) + POST + DELETE /api/jobs
-      story/route.ts      POST /api/story (LLM tulis naskah → job VO per adegan)
+      story/route.ts      GET (?limit=N, cerita terbaru + naskahnya) + POST /api/story (LLM tulis naskah → job VO per adegan)
+      transcriptions/route.ts  GET (full + ?fields=light) + POST /api/transcriptions
+      transcriptions/[id]/route.ts  DELETE /api/transcriptions/<id> (hapus row + file audio)
       ping/route.ts       GET /api/ping (keep-alive Supabase, query paling ringan)
   lib/supabase.ts         Client browser (anon) + server (service role)
-supabase/schema.sql       Tabel voices + jobs + stories, RLS + policy
+supabase/schema.sql       Tabel voices + jobs + stories + transcriptions, RLS + policy
 vercel.json               1 cron harian → /api/ping (cegah pause Supabase 7 hari)
 worker/
-  worker.py               Polling jobs, pecah teks, gabung, normalisasi
+  worker.py               Polling jobs + transcriptions, pecah teks, gabung, normalisasi
   synthesize.py           Sintesis 1 chunk (proses fresh, pola terbukti)
+  transcribe.py           Transkripsi 1 audio (proses fresh, faster-whisper small)
   requirements.txt        Dependensi worker (non-torch)
   README.md               Setup worker lengkap
 .env.example              Daftar env vars (HANYA placeholder — tanpa nilai rahasia)
@@ -250,6 +283,23 @@ worker/
 
 ## Riwayat perubahan
 
+- **2026-11-23 — Transkrip Whisper (v1.2):** tab baru "Transkrip" —
+  unggah audio → worker di box mentranskrip (faster-whisper model
+  "small", CPU int8, `vad_filter=True`) → teks + segmen ber-timestamp
+  tampil di UI, bisa disalin dan diunduh .txt/.srt (SRT dibuat
+  client-side). Baru: tabel `transcriptions` + policy Storage bucket
+  `transcript-audio` (private) di `supabase/schema.sql`; API
+  `GET/POST /api/transcriptions` (+ `?fields=light`) dan
+  `DELETE /api/transcriptions/<id>`; `worker/transcribe.py` (proses
+  fresh, pola `transcribe_vo.py` Ayam Bawang) + polling transkripsi
+  di `worker.py` (VO diprioritaskan, SATU job dalam satu waktu —
+  tidak paralel dengan sintesis VoxCPM2); `faster-whisper` di
+  `worker/requirements.txt` + §7 di `worker/README.md`. Yang HARUS
+  dilakukan manual: buat bucket `transcript-audio` (private) di
+  Dashboard, jalankan ulang schema.sql, instal faster-whisper +
+  unduh model small di box, restart worker. Tes: `npm run lint`
+  bersih, `npm run build` sukses. Uji end-to-end (upload → worker →
+  teks tampil) BELUM dilakukan — butuh box aktif + schema baru.
 - **2026-11-23 — UI/UX studio ala OmniVoice (v1.1):** tema Sistem/Gelap/
   Terang + script pra-paint (tanpa kedipan), layout 2 kolom, tab Voice
   Clone / Voice Design / Cerita, panel Hasil Sintesis + Parameter Aktif,

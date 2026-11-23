@@ -70,3 +70,25 @@ export function publicOutputUrl(outputPath: string | null): string | null {
   if (!url) return null;
   return `${url.replace(/\/$/, "")}/storage/v1/object/public/vo-outputs/${outputPath}`;
 }
+
+export type TranscriptionStatus = "queued" | "processing" | "done" | "failed";
+
+/** Satu segmen transkrip ber-timestamp (waktu dalam detik). */
+export type TranscriptionSegment = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+export type Transcription = {
+  id: string;
+  audio_path: string;
+  audio_name: string | null;
+  model: string;
+  language: string;
+  status: TranscriptionStatus;
+  text: string | null;
+  segments: TranscriptionSegment[] | null;
+  error: string | null;
+  created_at: string;
+};

@@ -3,6 +3,10 @@ import { getServiceClient } from "@/lib/supabase";
 
 /**
  * POST /api/story — Cerita ala bang-story (HANYA naskahnya).
+ * GET  /api/story?limit=N — cerita terbaru dulu (default 1, maks 10),
+ *   lengkap dengan naskahnya (script) — dipakai halaman utama supaya
+ *   naskah cerita terakhir tetap tampil setelah reload, bukan cuma
+ *   di sesi saat dibuat.
  *
  * Body JSON:
  *   { idea: string, durationTarget: string, voiceId: string, language?: string }
@@ -170,6 +174,28 @@ function serviceUnavailable() {
     },
     { status: 503 },
   );
+}
+
+export async function GET(req: NextRequest) {
+  const supabase = getServiceClient();
+  if (!supabase) return serviceUnavailable();
+
+  // ?limit=N — berapa cerita terbaru yang diambil (default 1, maks 10).
+  const rawLimit = Number(req.nextUrl.searchParams.get("limit") ?? "1");
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), 10)
+    : 1;
+
+  const { data, error } = await supabase
+    .from("stories")
+    .select("id, idea, duration_target, language, script, created_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+  return NextResponse.json({ stories: data ?? [] });
 }
 
 export async function POST(req: NextRequest) {
