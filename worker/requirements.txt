@@ -1,0 +1,13 @@
+# Worker VO Studio — dependensi Python
+#
+# PENTING: instal torch + torchaudio DULU dari index CPU PyTorch,
+# SEBELUM paket lain (lihat worker/README.md §2). Bila torchaudio
+# terinstal dari PyPI biasa, import gagal (libcudart.so tidak ada)
+# — persis jebakan yang didokumentasikan di VO-VOXCPM.md §1.
+# File ini HANYA berisi paket non-torch; torch/torchaudio diinstal
+# terpisah dengan perintah di README.
+
+supabase>=2.0
+voxcpm==2.0.3
+soundfile>=0.12
+numpy>=1.26
