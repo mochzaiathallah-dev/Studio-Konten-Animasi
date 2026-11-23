@@ -99,9 +99,24 @@ create policy "stories_all_anon" on public.stories
 --      biarkan "Public bucket" MATI.
 --   2. Bucket `vo-outputs`  — PUBLIC (hasil VO diputar/diunduh web).
 --      New bucket → nama "vo-outputs", nyalakan "Public bucket".
--- Policy Storage untuk bucket tersebut diatur otomatis oleh Supabase
--- saat bucket dibuat; untuk alat pribadi, tambahkan di
--- Dashboard → Storage → Policies bila upload dari browser ditolak:
---   voice-refs:  INSERT + SELECT untuk role anon/authenticated
---   vo-outputs:  SELECT untuk role anon/authenticated (public read)
---                INSERT/UPDATE/DELETE hanya service role (worker).
+-- Policy Storage di bawah ini WAJIB dijalankan (RLS aktif di
+-- storage.objects dan TIDAK ada policy bawaan — tanpa ini, upload
+-- audio dari browser ditolak "new row violates row-level security
+-- policy" meski tabel sudah benar). Policy ini bagian dari file ini,
+-- jadi cukup jalankan ulang schema.sql ini sekali.
+drop policy if exists "voice_refs_insert_anon" on storage.objects;
+create policy "voice_refs_insert_anon" on storage.objects
+  for insert to anon, authenticated
+  with check (bucket_id = 'voice-refs');
+
+drop policy if exists "voice_refs_select_anon" on storage.objects;
+create policy "voice_refs_select_anon" on storage.objects
+  for select to anon, authenticated
+  using (bucket_id = 'voice-refs');
+
+drop policy if exists "vo_outputs_select_anon" on storage.objects;
+create policy "vo_outputs_select_anon" on storage.objects
+  for select to anon, authenticated
+  using (bucket_id = 'vo-outputs');
+-- Upload/update/delete di vo-outputs hanya lewat service role
+-- (worker) — service role bypass RLS, jadi tidak butuh policy.

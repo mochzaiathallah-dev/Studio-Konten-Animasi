@@ -170,7 +170,12 @@ Bila key belum diisi, fitur Cerita menampilkan error jelas
 1. Buat project di [supabase.com](https://supabase.com) (free tier cukup).
 2. Buka **SQL Editor** → jalankan isi `supabase/schema.sql`
    (tabel `voices` + `jobs` + `stories`, RLS aktif + policy permissive untuk
-   alat pribadi — baca komentar keamanan di file itu).
+   alat pribadi — baca komentar keamanan di file itu — plus policy
+   Storage untuk bucket di bawah. Tanpa policy Storage, upload audio
+   dari browser ditolak "new row violates row-level security policy".
+   Bila schema.sql sudah pernah dijalankan sebelum policy Storage
+   ditambahkan, jalankan ulang file ini sekali — semua perintahnya
+   idempotent).
 3. Buka **Storage** → buat 2 bucket:
    - `voice-refs` — **private** (audio referensi).
    - `vo-outputs` — **public** (hasil VO diputar/diunduh web).
