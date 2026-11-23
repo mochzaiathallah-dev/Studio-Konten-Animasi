@@ -142,27 +142,28 @@ MP4. Website ini mengambil **HANYA bagian naskahnya**:
   dipakai), editor timeline, ekspor MP4. Cerita di sini berhenti di
   audio per adegan — cukup untuk naskah + narasi.
 
-Penyedia naskah diatur lewat env (route `/api/story` memakai format
-OpenAI chat completions; tanpa env LLM, defaultnya OpenAI):
+Cukup isi SATU key di env — provider dan model dikenali otomatis
+dari bentuk key-nya (route `/api/story` memakai format OpenAI chat
+completions):
 
-- **OpenAI** (default): isi `OPENAI_API_KEY` saja. Cara dapat key:
-  [platform.openai.com](https://platform.openai.com) → API keys →
-  Create new secret key. Perkiraan biaya: gpt-4o-mini ≈ $0,15/1 juta
-  token input + $0,60/1 juta token output — satu naskah cerita
-  (3–8 adegan) kira-kira $0,001–0,003 (kurang dari Rp50). Cek harga
-  terbaru di platform.openai.com.
-- **Gemini** (gratis, via endpoint OpenAI-kompatibel Google): isi
-  `LLM_API_KEY` = key Gemini dari [Google AI Studio](https://aistudio.google.com)
-  → Get API key, `LLM_BASE_URL` =
-  `https://generativelanguage.googleapis.com/v1beta/openai`, dan
-  `LLM_MODEL` = `gemini-2.5-flash` (model lain bisa diganti lewat env
-  yang sama). `LLM_API_KEY` didahulukan; bila kosong, route memakai
-  `OPENAI_API_KEY` sebagai fallback.
+- **Gemini** (gratis): isi `GEMINI_API_KEY` = key dari
+  [Google AI Studio](https://aistudio.google.com) → Get API key.
+  Key yang bukan "sk-" dianggap Gemini → route memakai endpoint
+  OpenAI-kompatibel Google dan mencari model otomatis dari daftar
+  model (diutamakan seri Flash terbaru; bila pencarian gagal, dipakai
+  `gemini-3.8-flash`). Bila model pertama sedang penuh atau sudah
+  tidak tersedia, route otomatis mencoba model berikut (maks 3).
+- **OpenAI**: isi `OPENAI_API_KEY` saja (atau `LLM_API_KEY`).
+  Key diawali "sk-" → route memakai api.openai.com dengan model
+  `gpt-4o-mini`. Perkiraan biaya: gpt-4o-mini ≈ $0,15/1 juta token
+  input + $0,60/1 juta token output — satu naskah cerita (3–8 adegan)
+  kira-kira $0,001–0,003 (kurang dari Rp50). Cek harga terbaru di
+  platform.openai.com.
 
 Key LLM HANYA dipakai server (`/api/story`) — tidak pernah dikirim ke
 frontend dan tidak boleh di-commit ke repo (lihat `.env.example`).
 Bila key belum diisi, fitur Cerita menampilkan error jelas
-"LLM_API_KEY belum diisi" (bukan crash).
+"GEMINI_API_KEY belum diisi" (bukan crash).
 
 ## Setup Supabase
 
@@ -192,8 +193,8 @@ npm run build                # verifikasi build produksi
 3. Isi **Environment Variables** (sama seperti `.env.local`):
    `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
    `SUPABASE_SERVICE_ROLE_KEY`, dan (opsional, hanya untuk fitur
-   Cerita) `LLM_API_KEY` + `LLM_BASE_URL` + `LLM_MODEL` (Gemini),
-   atau `OPENAI_API_KEY` saja (OpenAI, default).
+   Cerita) `GEMINI_API_KEY` saja (atau `LLM_API_KEY`/`OPENAI_API_KEY` —
+   provider + model dikenali otomatis).
 4. Deploy. Website + API routes jalan; **worker TIDAK ikut ter-deploy**
    (lihat bawah). Cron harian keep-alive (`vercel.json`) ikut
    ter-deploy otomatis — 1 cron ke `/api/ping` tiap tengah malam UTC.

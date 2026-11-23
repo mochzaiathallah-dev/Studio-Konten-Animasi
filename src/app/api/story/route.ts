@@ -23,11 +23,10 @@ import { getServiceClient } from "@/lib/supabase";
  *   5. Kembalikan { storyId, scenes: [{ title, narration, jobId }] }.
  *
  * LLM dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2
- * (kloning suara referensi). Key LLM HANYA di server (env LLM_API_KEY,
- * fallback OPENAI_API_KEY) — tidak pernah dikirim ke frontend.
- * Provider bisa OpenAI (default) atau Gemini lewat endpoint
- * OpenAI-kompatibel Google — diatur lewat LLM_BASE_URL + LLM_MODEL
- * (lihat .env.example).
+ * (kloning suara referensi). Key LLM HANYA di server (env
+ * GEMINI_API_KEY, LLM_API_KEY, atau OPENAI_API_KEY) — tidak pernah
+ * dikirim ke frontend. Provider (OpenAI/Gemini) dan model dikenali
+ * otomatis dari key-nya (lihat .env.example).
  *
  * Catatan Next.js 16 (cacheComponents aktif): route handler yang memakai
  * `request` sudah dinamis secara default — tanpa `dynamic =
@@ -36,26 +35,117 @@ import { getServiceClient } from "@/lib/supabase";
 
 /**
  * Penyedia penulis naskah (format OpenAI chat completions).
- * LLM_API_KEY didahulukan; OPENAI_API_KEY dipakai sebagai fallback supaya
- * konfigurasi lama tetap jalan. Tanpa LLM_BASE_URL/LLM_MODEL, defaultnya
- * OpenAI (api.openai.com, gpt-4o-mini).
- * Untuk Gemini: LLM_API_KEY=<key Gemini dari Google AI Studio>,
- * LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai,
- * LLM_MODEL=gemini-2.5-flash
+ * Di env cukup SATU key — GEMINI_API_KEY (didahulukan), LLM_API_KEY,
+ * atau OPENAI_API_KEY sebagai fallback. Provider dikenali otomatis
+ * dari bentuk key-nya (key OpenAI diawali "sk-", key lain dianggap
+ * Gemini), dan model dicari otomatis dari daftar model provider itu
+ * (GET {base}/models) — jadi tidak ada lagi LLM_BASE_URL/LLM_MODEL
+ * di env. Bila pencarian model gagal, dipakai model default di bawah.
  */
-const DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_MODEL = "gpt-4o-mini";
+type LlmProvider = "gemini" | "openai";
 
-function resolveLlmConfig() {
-  const apiKey =
+const PROVIDERS: Record<
+  LlmProvider,
+  { baseUrl: string; defaultModel: string; prefer: RegExp[] }
+> = {
+  gemini: {
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    defaultModel: "gemini-3.8-flash",
+    prefer: [
+      /^gemini-[\d.]+-flash$/,
+      /^gemini-[\d.]+-flash-preview$/,
+      /^gemini-[\d.]+-flash-lite$/,
+      /^gemini-flash-latest$/,
+    ],
+  },
+  openai: {
+    baseUrl: "https://api.openai.com/v1",
+    defaultModel: "gpt-4o-mini",
+    prefer: [/^gpt-4o-mini$/, /^gpt-4o/],
+  },
+};
+
+// Model non-chat yang jangan sampai terpilih dari daftar model.
+const NON_CHAT_MODEL = /embedding|imagen|veo|tts|aqa|learnlm|-image/i;
+
+function resolveLlmKey() {
+  return (
+    process.env.GEMINI_API_KEY?.trim() ||
     process.env.LLM_API_KEY?.trim() ||
     process.env.OPENAI_API_KEY?.trim() ||
-    "";
-  const baseUrl = (
-    process.env.LLM_BASE_URL?.trim() || DEFAULT_BASE_URL
-  ).replace(/\/+$/, "");
-  const model = process.env.LLM_MODEL?.trim() || DEFAULT_MODEL;
-  return { apiKey, url: `${baseUrl}/chat/completions`, model };
+    ""
+  );
+}
+
+function detectProvider(apiKey: string): LlmProvider {
+  // Key OpenAI selalu diawali "sk-"; key lain (Google "AIza…",
+  // "AQ.…" dan format Google lainnya) dianggap Gemini.
+  return apiKey.startsWith("sk-") ? "openai" : "gemini";
+}
+
+function versionOf(id: string) {
+  const m = id.match(/^gemini-([\d.]+)/);
+  return m ? m[1].split(".").map(Number) : [0];
+}
+
+function compareVersionDesc(a: string, b: string) {
+  const va = versionOf(a);
+  const vb = versionOf(b);
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+    const d = (vb[i] ?? 0) - (va[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+function rankModels(provider: LlmProvider, ids: string[]) {
+  const chat = ids.filter(
+    (id) =>
+      id.startsWith(provider === "gemini" ? "gemini-" : "gpt-") &&
+      !NON_CHAT_MODEL.test(id),
+  );
+  const ranked: string[] = [];
+  for (const pattern of PROVIDERS[provider].prefer) {
+    const hits = chat.filter((id) => pattern.test(id)).sort(compareVersionDesc);
+    for (const hit of hits) {
+      if (!ranked.includes(hit)) ranked.push(hit);
+    }
+  }
+  if (ranked.length === 0 && chat[0]) ranked.push(chat[0]);
+  if (ranked.length === 0) ranked.push(PROVIDERS[provider].defaultModel);
+  return ranked.slice(0, 3);
+}
+
+// Cache daftar model hasil discovery per provider (di memori instance
+// ini); gagal/kedaluwarsa → dicari ulang, dan selalu ada model default.
+const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
+const modelCache = new Map<string, { models: string[]; at: number }>();
+
+async function discoverModels(provider: LlmProvider, apiKey: string) {
+  const cached = modelCache.get(provider);
+  if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS)
+    return cached.models;
+  const fallback = [PROVIDERS[provider].defaultModel];
+  try {
+    const res = await fetch(`${PROVIDERS[provider].baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return fallback;
+    const data = (await res.json()) as { data?: { id?: unknown }[] };
+    // Endpoint kompatibel mengembalikan id berawalan "models/"
+    // (mis. "models/gemini-2.5-flash") — buang awalan itu dulu.
+    const ids = (data.data ?? [])
+      .map((m) =>
+        typeof m?.id === "string" ? m.id.replace(/^models\//, "") : "",
+      )
+      .filter(Boolean);
+    const models = rankModels(provider, ids);
+    modelCache.set(provider, { models, at: Date.now() });
+    return models;
+  } catch {
+    return fallback;
+  }
 }
 
 // Durasi target → jumlah adegan (durasi VO akhir mengikuti panjang
@@ -86,16 +176,22 @@ export async function POST(req: NextRequest) {
   const supabase = getServiceClient();
   if (!supabase) return serviceUnavailable();
 
-  const llm = resolveLlmConfig();
-  if (!llm.apiKey) {
+  const apiKey = resolveLlmKey();
+  if (!apiKey) {
     return NextResponse.json(
       {
         error:
-          "LLM_API_KEY belum diisi — isi di .env.local (lokal) atau Environment Variables Vercel (fallback: OPENAI_API_KEY). Untuk Gemini, key gratis didapat di aistudio.google.com → Get API key, lalu isi juga LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai dan LLM_MODEL=gemini-2.5-flash. Key ini dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2.",
+          "GEMINI_API_KEY belum diisi — isi di .env.local (lokal) atau Environment Variables Vercel (boleh juga LLM_API_KEY atau OPENAI_API_KEY). Untuk Gemini, key gratis didapat di aistudio.google.com → Get API key. Provider dan model dikenali otomatis dari key-nya, jadi tidak perlu isi apa pun lagi. Key ini dipakai HANYA untuk menulis naskah; suara tetap VoxCPM2.",
       },
       { status: 503 },
     );
   }
+  const provider = detectProvider(apiKey);
+  const llm = {
+    apiKey,
+    url: `${PROVIDERS[provider].baseUrl}/chat/completions`,
+    models: await discoverModels(provider, apiKey),
+  };
 
   let body: {
     idea?: unknown;
@@ -173,36 +269,57 @@ export async function POST(req: NextRequest) {
 
   let scenes: Scene[];
   try {
-    const llmRes = await fetch(llm.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${llm.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: llm.model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.8,
-      }),
-    });
-
-    if (!llmRes.ok) {
-      let detail = "";
-      try {
-        const errJson = (await llmRes.json()) as {
-          error?: { message?: string };
-        };
-        detail = errJson.error?.message ?? "";
-      } catch {
-        // Abaikan — pakai pesan generik di bawah.
+    // Coba model hasil discovery satu per satu (maks 3): model
+    // pertama yang penuh (429/503) diulang sekali, lalu lanjut ke
+    // model berikut; model yang sudah tidak tersedia (404) langsung
+    // dilewati. Teramati langsung saat uji Gemini: gemini-3.8-flash
+    // 503 "high demand" dua kali, gemini-2.5-flash 404 "no longer
+    // available to new users", gemini-3-flash-preview 200.
+    let llmRes: Response | null = null;
+    let lastDetail = "";
+    candidateLoop: for (const model of llm.models) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        llmRes = await fetch(llm.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${llm.apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt },
+            ],
+            response_format: { type: "json_object" },
+            temperature: 0.8,
+          }),
+        });
+        if (llmRes.ok) break candidateLoop;
+        try {
+          const errJson = (await llmRes.json()) as {
+            error?: { message?: string };
+          };
+          lastDetail = errJson.error?.message ?? "";
+        } catch {
+          // Abaikan — pakai pesan generik di bawah.
+        }
+        if (llmRes.status === 404) break; // model tidak tersedia → model berikut
+        if (llmRes.status === 429 || llmRes.status === 503) {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          break; // sudah diulang sekali → model berikut
+        }
+        break; // error lain (401 dsb.) → berhenti
       }
+    }
+
+    if (!llmRes || !llmRes.ok) {
       return NextResponse.json(
         {
-          error: `LLM menolak permintaan (${llmRes.status})${detail ? `: ${detail}` : ""} — periksa LLM_API_KEY (atau OPENAI_API_KEY) dan kuota akun LLM Anda.`,
+          error: `LLM menolak permintaan (${llmRes?.status ?? "?"})${lastDetail ? `: ${lastDetail}` : ""} — periksa GEMINI_API_KEY (atau LLM_API_KEY/OPENAI_API_KEY) dan kuota akun LLM Anda.`,
         },
         { status: 502 },
       );
