@@ -1436,6 +1436,7 @@ export default function Home() {
                             expanded || preview.length <= 300
                               ? preview
                               : `${preview.slice(0, 300)}…`;
+                          const hasSegments = tr.segments && tr.segments.length > 0;
                           const baseName = (tr.audio_name ?? "transkrip").replace(
                             /\.[^.]+$/,
                             "",
@@ -1481,7 +1482,14 @@ export default function Home() {
                                   >
                                     {shown}
                                   </p>
-                                  {preview.length > 300 && (
+                                  {/*
+                                    Tombol tampil bila teks panjang ATAU ada segmen:
+                                    transkrip pendek (mis. 93 karakter) tidak punya
+                                    tombol "Lihat selengkapnya" tapi segmennya tetap
+                                    harus bisa dibuka — kalau tidak, timestamp tidak
+                                    pernah terlihat di kartu.
+                                  */}
+                                  {(preview.length > 300 || hasSegments) && (
                                     <button
                                       type="button"
                                       onClick={() =>
@@ -1489,7 +1497,11 @@ export default function Home() {
                                       }
                                       className="btn-secondary mt-2"
                                     >
-                                      {expanded ? "Tutup" : "Lihat selengkapnya"}
+                                      {expanded
+                                        ? "Tutup"
+                                        : preview.length > 300
+                                          ? "Lihat selengkapnya"
+                                          : "Lihat segmen ber-timestamp"}
                                     </button>
                                   )}
                                   {expanded && tr.segments && tr.segments.length > 0 && (
